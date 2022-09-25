@@ -266,6 +266,11 @@ class SAC(OffPolicyAlgorithm):
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+            self.logger.record("train_g/ent_coef", ent_coef.item())
+            if len(ent_coef_losses) > 0:
+                self.logger.record("train_g/ent_coef_loss", ent_coef_loss.item())
+            self.logger.record("train_g/actor_loss", actor_loss.item())
+            self.logger.record("train_g/critic_loss", critic_loss.item())
 
         self._n_updates += gradient_steps
 
