@@ -335,6 +335,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         tb_log_name: str = "run",
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
+        warm_steps = None,
     ) -> "OffPolicyAlgorithm":
 
         total_timesteps, callback = self._setup_learn(
@@ -349,6 +350,10 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         )
 
         callback.on_training_start(locals(), globals())
+
+        if warm_steps is not None:
+            print("Performing warm start optimization.")
+            self.train(batch_size=self.batch_size, gradient_steps=warm_steps)
 
         while self.num_timesteps < total_timesteps:
             rollout = self.collect_rollouts(

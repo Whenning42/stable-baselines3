@@ -4,6 +4,7 @@ import gym
 import numpy as np
 import torch as th
 from torch.nn import functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
@@ -11,6 +12,7 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.sac.policies import SACPolicy
+import tqdm
 
 
 class SAC(OffPolicyAlgorithm):
@@ -140,6 +142,10 @@ class SAC(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer = None
 
+        # Training loggign
+        self.global_step = 0
+        self.writer = SummaryWriter()
+
         if _init_setup_model:
             self._setup_model()
 
@@ -194,7 +200,7 @@ class SAC(OffPolicyAlgorithm):
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
 
-        for gradient_step in range(gradient_steps):
+        for gradient_step in tqdm.tqdm(range(gradient_steps)):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
@@ -258,7 +264,15 @@ class SAC(OffPolicyAlgorithm):
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
 
+            # not_perturbed = 1 - th.Tensor([info.get("perturbed", False) for info in replay_data.infos]).to("cuda")
+            # # This line just ensures the distribution is correctly initialized
+            # actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            # action_log_prob = self.actor.action_dist.log_prob(replay_data.actions)
+            # print(action_log_prob * not_perturbed)
+            # mean_action_log_prob = th.sum(not_perturbed * action_log_prob) / th.sum(not_perturbed)
+
             # Optimize the actor
+            # actor_loss += -.25 * action_log_prob.mean() # EXPERIMENTAL
             self.actor.optimizer.zero_grad()
             actor_loss.backward()
             self.actor.optimizer.step()
@@ -266,11 +280,25 @@ class SAC(OffPolicyAlgorithm):
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
-            self.logger.record("train_g/ent_coef", ent_coef.item())
-            if len(ent_coef_losses) > 0:
-                self.logger.record("train_g/ent_coef_loss", ent_coef_loss.item())
-            self.logger.record("train_g/actor_loss", actor_loss.item())
-            self.logger.record("train_g/critic_loss", critic_loss.item())
+
+            # Log metrics
+            # self.writer.add_scalar("train_g/ent_coef", ent_coef.item(), self.global_step)
+            # if len(ent_coef_losses) > 0:
+            #     self.writer.add_scalar("train_g/ent_coef_loss", ent_coef_loss.item(), self.global_step)
+            # self.writer.add_scalar("train_g/actor_loss", actor_loss.item(), self.global_step)
+            # self.writer.add_scalar("train_g/critic_loss", critic_loss.item(), self.global_step)
+            # self.writer.add_scalar("train_g/action_entropy", -log_prob.mean().item(), self.global_step)
+            # self.writer.add_scalar("train_g/min_qf_pi", min_qf_pi.mean().item(), self.global_step)
+            # self.writer.add_scalar("train_g/current_q", current_q_values[0].mean().item(), self.global_step)
+            # self.writer.add_scalar("train_g/target_q", target_q_values.mean().item(), self.global_step)
+            # dq = target_q_values - current_q_values[0]
+            # self.writer.add_scalar("train_g/dq_mean", dq.mean().item(), self.global_step)
+            # self.writer.add_scalar("train_g/dq_std", dq.std().item(), self.global_step)
+            # self.writer.add_scalar("train_q/bc_log_loss", mean_action_log_prob.item(), self.global_step)
+
+            # TODO: Log action std
+            # TODO: Clip action std if necessary
+            self.global_step += 1
 
         self._n_updates += gradient_steps
 
@@ -292,6 +320,7 @@ class SAC(OffPolicyAlgorithm):
         tb_log_name: str = "SAC",
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
+        warm_steps: Optional[int] = None,
     ) -> OffPolicyAlgorithm:
 
         return super(SAC, self).learn(
@@ -304,10 +333,11 @@ class SAC(OffPolicyAlgorithm):
             tb_log_name=tb_log_name,
             eval_log_path=eval_log_path,
             reset_num_timesteps=reset_num_timesteps,
+            warm_steps=warm_steps
         )
 
     def _excluded_save_params(self) -> List[str]:
-        return super(SAC, self)._excluded_save_params() + ["actor", "critic", "critic_target"]
+        return super(SAC, self)._excluded_save_params() + ["actor", "critic", "critic_target", "writer"]
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
