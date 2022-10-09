@@ -103,6 +103,7 @@ class SAC(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        profiler = None,
     ):
 
         super(SAC, self).__init__(
@@ -132,6 +133,7 @@ class SAC(OffPolicyAlgorithm):
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=(gym.spaces.Box),
             support_multi_env=True,
+            profiler=profiler,
         )
 
         self.target_entropy = target_entropy
@@ -142,9 +144,10 @@ class SAC(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer = None
 
-        # Training loggign
+        # Training logging
         self.global_step = 0
         self.writer = SummaryWriter()
+        self.profiler = profiler
 
         if _init_setup_model:
             self._setup_model()
@@ -187,6 +190,9 @@ class SAC(OffPolicyAlgorithm):
         self.critic_target = self.policy.critic_target
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        if self.profiler is not None:
+            self.profiler.begin("Train")
+
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizers learning rate
@@ -308,6 +314,9 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+
+        if self.profiler is not None:
+            self.profiler.end("Train")
 
     def learn(
         self,
