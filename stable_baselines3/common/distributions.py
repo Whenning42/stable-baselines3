@@ -296,6 +296,48 @@ class CategoricalDistribution(Distribution):
         log_prob = self.log_prob(actions)
         return actions, log_prob
 
+class MultiDistrbution(Distribution):
+    """A class that holds a sequence or tuple of distributions.
+    
+    Implementation is pulled fom MultiCategoricalDistribution"""
+
+    def __init__(self, action_dims: List[int], distribution_classes: List[Distribution]):
+        super(MultiDistribution, self).__init__()
+        self.action_dims = action_dims
+        self.distribution_classes = distribution_classes
+
+    def proba_distribution_net(self, latent_dim: int) -> nn.Module:
+        action_logits = nn.Linear(latent_dim, sum(self.action_dims))
+        return action_logits
+
+    def proba_distribution(self, action_logits: th.Tensor) -> "MultiDistribution":
+        self.distribution = [cls(logits=split) for split, cls in zip(th.split(action_logits, tuple(self.action_dims), dim=1), self.distribution_classes)]
+        return self
+
+    def log_prob(self, actions: th.Tensor) -> th.Tensor:
+        # Extract each discrete action and compute log prob for their respective distributions
+        return th.stack(
+            [dist.log_prob(action) for dist, action in zip(self.distribution, th.unbind(actions, dim=1))], dim=1
+        ).sum(dim=1)
+
+    def entropy(self) -> th.Tensor:
+        return th.stack([dist.entropy() for dist in self.distribution], dim=1).sum(dim=1)
+
+    def sample(self) -> th.Tensor:
+        return th.stack([dist.sample() for dist in self.distribution], dim=1)
+
+    def mode(self) -> th.Tensor:
+        return th.stack([th.argmax(dist.probs, dim=1) for dist in self.distribution], dim=1)
+
+    def actions_from_params(self, action_logits: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        # Update the proba distribution
+        self.proba_distribution(action_logits)
+        return self.get_actions(deterministic=deterministic)
+
+    def log_prob_from_params(self, action_logits: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        actions = self.actions_from_params(action_logits)
+        log_prob = self.log_prob(actions)
+        return actions, log_prob
 
 class MultiCategoricalDistribution(Distribution):
     """
@@ -596,6 +638,90 @@ class StateDependentNoiseDistribution(Distribution):
         log_prob = self.log_prob(actions)
         return actions, log_prob
 
+class TupleDistribution(Distribution):
+    """Tuple distribution."""
+
+    def __init__(self, distributions: Tuple[Distribution]):
+        super(Distribution, self).__init__()
+        self.distributions = distributions
+
+    @abstractmethod
+    def proba_distribution_net(self, *args, **kwargs) -> Union[nn.Module, Tuple[nn.Module, nn.Parameter]]:
+        # TODO
+        """Create the layers and parameters that represent the distribution.
+
+        Subclasses must define this, but the arguments and return type vary between
+        concrete classes."""
+
+    @abstractmethod
+    def proba_distribution(self, *args, **kwargs) -> "Distribution":
+        """Set parameters of the distribution.
+
+        :return: self
+        """
+
+    @abstractmethod
+    def log_prob(self, x: th.Tensor) -> th.Tensor:
+        """
+        Returns the log likelihood
+
+        :param x: the taken action
+        :return: The log likelihood of the distribution
+        """
+
+    @abstractmethod
+    def entropy(self) -> Optional[th.Tensor]:
+        """
+        Returns Shannon's entropy of the probability
+
+        :return: the entropy, or None if no analytical form is known
+        """
+
+    @abstractmethod
+    def sample(self) -> th.Tensor:
+        """
+        Returns a sample from the probability distribution
+
+        :return: the stochastic action
+        """
+
+    @abstractmethod
+    def mode(self) -> th.Tensor:
+        """
+        Returns the most likely action (deterministic output)
+        from the probability distribution
+
+        :return: the stochastic action
+        """
+
+    def get_actions(self, deterministic: bool = False) -> th.Tensor:
+        """
+        Return actions according to the probability distribution.
+
+        :param deterministic:
+        :return:
+        """
+        if deterministic:
+            return self.mode()
+        return self.sample()
+
+    @abstractmethod
+    def actions_from_params(self, *args, **kwargs) -> th.Tensor:
+        """
+        Returns samples from the probability distribution
+        given its parameters.
+
+        :return: actions
+        """
+
+    @abstractmethod
+    def log_prob_from_params(self, *args, **kwargs) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Returns samples and the associated log probabilities
+        from the probability distribution given its parameters.
+
+        :return: actions and log prob
+        """
 
 class TanhBijector(object):
     """
@@ -641,6 +767,26 @@ class TanhBijector(object):
         return th.log(1.0 - th.tanh(x) ** 2 + self.epsilon)
 
 
+# Note: `dist_kwargs` appears unused
+def get_action_space_params(action_space: gym.spaces.Space) -> Tuple[int, T]:
+    if isinstance(action_space, spaces.Box):
+        assert len(action_space.shape) == 1, "Error: the action space must be a vector"
+        cls = StateDependentNoiseDistribution if use_sde else DiagGaussianDistribution
+        return get_action_dim(action_space), cls 
+    elif isinstance(action_space, spaces.Discrete):
+        return action_space.n, CategoricalDistribution
+    elif isinstance(action_space, spaces.MultiDiscrete):
+        return action_space.nvec, MultiCategoricalDistribution
+    elif isinstance(action_space, spaces.MultiBinary):
+        return action_space.n, BernoulliDistribution
+    else:
+        raise NotImplementedError(
+            "Error: probability distribution, not implemented as a leaf action space"
+            f"of type {type(action_space)}."
+            " Must be of type Gym Spaces: Box, Discrete, MultiDiscrete or MultiBinary."
+        )
+
+
 def make_proba_distribution(
     action_space: gym.spaces.Space, use_sde: bool = False, dist_kwargs: Optional[Dict[str, Any]] = None
 ) -> Distribution:
@@ -656,22 +802,19 @@ def make_proba_distribution(
     if dist_kwargs is None:
         dist_kwargs = {}
 
-    if isinstance(action_space, spaces.Box):
-        assert len(action_space.shape) == 1, "Error: the action space must be a vector"
-        cls = StateDependentNoiseDistribution if use_sde else DiagGaussianDistribution
-        return cls(get_action_dim(action_space), **dist_kwargs)
-    elif isinstance(action_space, spaces.Discrete):
-        return CategoricalDistribution(action_space.n, **dist_kwargs)
-    elif isinstance(action_space, spaces.MultiDiscrete):
-        return MultiCategoricalDistribution(action_space.nvec, **dist_kwargs)
-    elif isinstance(action_space, spaces.MultiBinary):
-        return BernoulliDistribution(action_space.n, **dist_kwargs)
-    else:
-        raise NotImplementedError(
-            "Error: probability distribution, not implemented for action space"
-            f"of type {type(action_space)}."
-            " Must be of type Gym Spaces: Box, Discrete, MultiDiscrete or MultiBinary."
-        )
+    del dist_kwargs
+
+    if isinstance(action_space, spaces.Tuple):
+        sizes = []
+        classes = []
+        for space in action_space:
+            n, distribution_cls = get_action_space_params(space)
+            sizes.append(n)
+            classes.append(distribution_cls)
+        return MultiDistribution(sizes, classes)
+
+    n, distribution_cls = get_action_space_params(action_space)
+    return distribution_cls(n)
 
 
 def kl_divergence(dist_true: Distribution, dist_pred: Distribution) -> th.Tensor:
