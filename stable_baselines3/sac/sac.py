@@ -13,6 +13,8 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import polyak_update
 from stable_baselines3.sac.policies import SACPolicy
 import tqdm
+import threading
+import time
 
 
 class SAC(OffPolicyAlgorithm):
@@ -104,6 +106,9 @@ class SAC(OffPolicyAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
         profiler = None,
+        profiler_cls = None,
+        on_train_start = None,
+        on_train_end = None,
     ):
 
         super(SAC, self).__init__(
@@ -148,9 +153,17 @@ class SAC(OffPolicyAlgorithm):
         self.global_step = 0
         self.writer = SummaryWriter()
         self.profiler = profiler
+        if profiler_cls is not None:
+            self.training_profiler = profiler_cls(path="./training_profile.csv")
+        else:
+            self.training_profiler = None
+        self.scaler = th.cuda.amp.GradScaler()
 
         if _init_setup_model:
             self._setup_model()
+
+        self.train_start = on_train_start
+        self.train_end = on_train_end
 
     def _setup_model(self) -> None:
         super(SAC, self)._setup_model()
@@ -190,6 +203,9 @@ class SAC(OffPolicyAlgorithm):
         self.critic_target = self.policy.critic_target
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        if self.train_start is not None:
+            self.train_start()
+
         if self.profiler is not None:
             self.profiler.begin("Train")
 
@@ -206,17 +222,55 @@ class SAC(OffPolicyAlgorithm):
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
 
+        # Load the next replay data while the training loop is running.
+        next_replay = None
+        def GetReplayData():
+            nonlocal next_replay
+            # While not is data, wait
+            # Return data
+            while next_replay is None:
+                time.sleep(1e-6 * 50)
+            to_ret = next_replay
+            next_replay = None
+            return to_ret
+
+        should_exit = False
+        def LoadLoop():
+            nonlocal next_replay
+            # While data, wait
+            # Load new data
+            while not should_exit:
+                while next_replay is not None:
+                    if should_exit:
+                        break
+                    time.sleep(1e-6 * 50)
+                next_replay = self.replay_buffer.sample(batch_size, \
+                                                        env=self._vec_normalize_env)
+        t = threading.Thread(target=LoadLoop)
+        t.start()
         for gradient_step in tqdm.tqdm(range(gradient_steps)):
+            if self.training_profiler is not None:
+                self.training_profiler.begin("Gradient step")
+                self.training_profiler.begin("Sample")
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = GetReplayData()
+            # th.cuda.synchronize()
+            if self.training_profiler is not None:
+                self.training_profiler.end("Sample")
 
             # We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
                 self.actor.reset_noise()
 
-            # Action by the current actor for the sampled state
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-            log_prob = log_prob.reshape(-1, 1)
+            if self.training_profiler is not None:
+                self.training_profiler.begin("Sample actor prob")
+            with th.autocast(device_type='cuda', dtype=th.float16):
+                # Action by the current actor for the sampled state
+                actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+                # th.cuda.synchronize()
+                if self.training_profiler is not None:
+                    self.training_profiler.end("Sample actor prob")
+                log_prob = log_prob.reshape(-1, 1)
 
             ent_coef_loss = None
             if self.ent_coef_optimizer is not None:
@@ -235,40 +289,65 @@ class SAC(OffPolicyAlgorithm):
             # entropy temperature or alpha in the paper
             if ent_coef_loss is not None:
                 self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
+                self.scaler.scale(ent_coef_loss).backward()
+                self.scaler.step(self.ent_coef_optimizer)
 
             with th.no_grad():
-                # Select action according to policy
-                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
-                # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                # add entropy term
-                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
-                # td error + entropy term
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                with th.autocast(device_type='cuda', dtype=th.float16):
+                    # Select action according to policy
+                    if self.training_profiler is not None:
+                        self.training_profiler.begin("Sample actor next prob")
+                    next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                    # th.cuda.synchronize()
+                    if self.training_profiler is not None:
+                        self.training_profiler.end("Sample actor next prob")
+                    # Compute the next Q values: min over all critics targets
+                    if self.training_profiler is not None:
+                        self.training_profiler.begin("Get critic")
+                    next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                    # th.cuda.synchronize()
+                    if self.training_profiler is not None:
+                        self.training_profiler.end("Get critic")
+                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    # add entropy term
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                    # td error + entropy term
+                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            if self.training_profiler is not None:
+                self.training_profiler.begin("Get next critic")
+            with th.autocast(device_type='cuda', dtype=th.float16):
+                current_q_values = self.critic(replay_data.observations, replay_data.actions)
+                # th.cuda.synchronize()
+                if self.training_profiler is not None:
+                    self.training_profiler.end("Get next critic")
 
-            # Compute critic loss
-            critic_loss = 0.5 * sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
-            critic_losses.append(critic_loss.item())
+                # Compute critic loss
+                critic_loss = 0.5 * sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
+                critic_losses.append(critic_loss.item())
 
             # Optimize the critic
+            if self.training_profiler is not None:
+                self.training_profiler.begin("Critic back")
             self.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic.optimizer.step()
+            self.scaler.scale(critic_loss).backward()
+            self.scaler.step(self.critic.optimizer)
+            # th.cuda.synchronize()
+            if self.training_profiler is not None:
+                self.training_profiler.end("Critic back")
 
+            if self.training_profiler is not None:
+                self.training_profiler.begin("Actor back")
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
             # Mean over all critic networks
-            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
-            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-            actor_losses.append(actor_loss.item())
+            with th.autocast(device_type='cuda', dtype=th.float16):
+                q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+                min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+                actor_losses.append(actor_loss.item())
 
             # not_perturbed = 1 - th.Tensor([info.get("perturbed", False) for info in replay_data.infos]).to("cuda")
             # # This line just ensures the distribution is correctly initialized
@@ -280,12 +359,22 @@ class SAC(OffPolicyAlgorithm):
             # Optimize the actor
             # actor_loss += -.25 * action_log_prob.mean() # EXPERIMENTAL
             self.actor.optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor.optimizer.step()
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.step(self.actor.optimizer)
+            # th.cuda.synchronize()
+            if self.training_profiler is not None:
+                self.training_profiler.end("Actor back")
 
+            self.scaler.update()
+
+            if self.training_profiler is not None:
+                self.training_profiler.begin("polyak_update")
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+            # th.cuda.synchronize()
+            if self.training_profiler is not None:
+                self.training_profiler.end("polyak_update")
 
             # Log metrics
             # self.writer.add_scalar("train_g/ent_coef", ent_coef.item(), self.global_step)
@@ -305,6 +394,8 @@ class SAC(OffPolicyAlgorithm):
             # TODO: Log action std
             # TODO: Clip action std if necessary
             self.global_step += 1
+        should_exit = True
+        t.join()
 
         self._n_updates += gradient_steps
 
@@ -317,6 +408,9 @@ class SAC(OffPolicyAlgorithm):
 
         if self.profiler is not None:
             self.profiler.end("Train")
+
+        if self.train_end is not None:
+            self.train_end()
 
     def learn(
         self,
@@ -348,11 +442,11 @@ class SAC(OffPolicyAlgorithm):
     def _excluded_save_params(self) -> List[str]:
         return super(SAC, self)._excluded_save_params() + ["actor", "critic", "critic_target", "writer"]
 
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+    def _get_th_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
         if self.ent_coef_optimizer is not None:
-            saved_pytorch_variables = ["log_ent_coef"]
+            saved_pyth_variables = ["log_ent_coef"]
             state_dicts.append("ent_coef_optimizer")
         else:
-            saved_pytorch_variables = ["ent_coef_tensor"]
-        return state_dicts, saved_pytorch_variables
+            saved_pyth_variables = ["ent_coef_tensor"]
+        return state_dicts, saved_pyth_variables

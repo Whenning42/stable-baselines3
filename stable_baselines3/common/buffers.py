@@ -14,6 +14,7 @@ from stable_baselines3.common.type_aliases import (
     RolloutBufferSamples,
 )
 from stable_baselines3.common.vec_env import VecNormalize
+from profiler import Profiler
 
 try:
     # Check memory used by replay buffer when possible
@@ -208,6 +209,7 @@ class ReplayBuffer(BaseBuffer):
         self.handle_timeout_termination = handle_timeout_termination
         self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.infos = [{} for i in range(self.buffer_size)]
+        self.sample_profiler = Profiler(path="./sampling_profile.csv")
 
         if psutil is not None:
             total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
@@ -291,18 +293,26 @@ class ReplayBuffer(BaseBuffer):
         return self._get_samples(batch_inds, env=env)
 
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+        self.sample_profiler.begin("Sample")
         # Sample randomly the env idx
+        self.sample_profiler.begin("get_indices")
         env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+        self.sample_profiler.end("get_indices")
 
+        self.sample_profiler.begin("get_obs")
         if self.optimize_memory_usage:
             next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
         else:
             next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+        self.sample_profiler.end("get_obs")
 
+        self.sample_profiler.begin("get_infos")
         infos = []
         for i in batch_inds:
             infos.append(self.infos[i])
+        self.sample_profiler.end("get_infos")
 
+        self.sample_profiler.begin("build_data")
         data = (
             self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
             self.actions[batch_inds, env_indices, :],
@@ -312,7 +322,12 @@ class ReplayBuffer(BaseBuffer):
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
         )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)), infos)
+        self.sample_profiler.end("build_data")
+        self.sample_profiler.begin("build_samples")
+        ret = ReplayBufferSamples(*tuple(map(self.to_torch, data)), infos)
+        self.sample_profiler.end("build_samples")
+        self.sample_profiler.begin("extern", end="Sample")
+        return ret
 
 
 class RolloutBuffer(BaseBuffer):
