@@ -329,7 +329,7 @@ class MultiDistribution(Distribution):
 
         print("Action, Std shapes:", action_logits.shape, log_std.shape)
         dist_logits = th.split(action_logits, self.action_logit_sizes, dim=1)
-        dist_std = th.split(log_std, self.action_logit_sizes, dim=1)
+        dist_std = th.split(log_std, self.action_logit_sizes, dim=0)
         for i in range(len(self.action_dims)):
             action_dim = self.action_dims[i]
             cls = self.distribution_classes[i]
@@ -361,7 +361,7 @@ class MultiDistribution(Distribution):
         return th.stack([dist.entropy() for dist in self.distribution], dim=1).sum(dim=1)
 
     def sample(self) -> th.Tensor:
-        return th.cat([dist.sample() for dist in self.distribution], dim=0)[None]
+        return th.cat([dist.sample() for dist in self.distribution], dim=1)
 
     def mode(self) -> th.Tensor:
         m: List[th.Tensor] = []

@@ -249,7 +249,7 @@ def test_multidistribution():
     assert std_param.shape == (5,)
 
     action_logits_and_means = th.tensor([[1, 0, 1, 0, .5]])
-    log_std = th.tensor([[0, 0, 0, 0, 0]])
+    log_std = th.tensor([0, 0, 0, 0, 0])
     union_dist.proba_distribution(action_logits_and_means, log_std)
 
     distributions = [th.distributions.Categorical(logits=th.tensor([1, 0])),
@@ -268,6 +268,6 @@ def test_multidistribution():
     assert th.allclose(union_dist.mode(), th.tensor([0, 0, .5]))
 
     # sample, we use a mock distribution for determinism
-    union_dist.distribution = [MockDistribution(samples=[th.tensor([0, 0])]),
-                               MockDistribution(samples=[th.tensor([.78])])]
+    union_dist.distribution = [MockDistribution(samples=[th.tensor([[0, 0]])]),
+                               MockDistribution(samples=[th.tensor([[.78]])])]
     assert th.allclose(union_dist.sample(), th.tensor([0, 0, .78]))
