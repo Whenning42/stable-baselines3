@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Tuple
+from typing import Tuple, Sequence
 
 import gym
 import numpy as np
@@ -15,6 +15,7 @@ from stable_baselines3.common.distributions import (
     SquashedDiagGaussianDistribution,
     StateDependentNoiseDistribution,
     TanhBijector,
+    MultiDistribution,
     kl_divergence,
 )
 from stable_baselines3.common.utils import set_random_seed
@@ -228,3 +229,45 @@ def test_kl_divergence(dist_type):
         )
 
         assert th.allclose(full_kl_div, ad_hoc_kl)
+
+class MockDistribution:
+    def __init__(self, samples: Sequence[th.Tensor] = None):
+        if samples is None:
+            samples = []
+        self.samples = samples
+        self.i = 0
+
+    def sample(self):
+        s = self.samples[self.i]
+        i = (self.i + 1) % len(self.samples)
+        return s
+
+def test_multidistribution():
+    union_dist = MultiDistribution([[2, 2], 1], [MultiCategoricalDistribution, DiagGaussianDistribution])
+    logits_net, std_param = union_dist.proba_distribution_net(latent_dim=128)
+    assert logits_net.out_features == 5
+    assert std_param.shape == (5,)
+
+    action_logits_and_means = th.tensor([[1, 0, 1, 0, .5]])
+    log_std = th.tensor([[0, 0, 0, 0, 0]])
+    union_dist.proba_distribution(action_logits_and_means, log_std)
+
+    distributions = [th.distributions.Categorical(logits=th.tensor([1, 0])),
+                     th.distributions.Categorical(logits=th.tensor([1, 0])),
+                     th.distributions.normal.Normal(loc=.5, scale=1)]
+
+    # log_prob
+    action = th.tensor([[1, 1, .5]])
+    assert th.allclose(union_dist.log_prob(action),
+                       th.tensor([sum(d.log_prob(a) for d, a in zip(distributions, action[0]))]))
+
+    # entropy
+    assert th.allclose(union_dist.entropy(), th.tensor(sum(d.entropy() for d in distributions)))
+
+    # mode
+    assert th.allclose(union_dist.mode(), th.tensor([0, 0, .5]))
+
+    # sample, we use a mock distribution for determinism
+    union_dist.distribution = [MockDistribution(samples=[th.tensor([0, 0])]),
+                               MockDistribution(samples=[th.tensor([.78])])]
+    assert th.allclose(union_dist.sample(), th.tensor([0, 0, .78]))

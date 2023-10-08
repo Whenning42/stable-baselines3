@@ -1,13 +1,13 @@
 """Probability distributions."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
 
 import gym
 import torch as th
 from gym import spaces
 from torch import nn
-from torch.distributions import Bernoulli, Categorical, Normal
+from torch.distributions import Bernoulli, Categorical, Normal, Distribution as TorchDistribution
 
 from stable_baselines3.common.preprocessing import get_action_dim
 
@@ -296,38 +296,81 @@ class CategoricalDistribution(Distribution):
         log_prob = self.log_prob(actions)
         return actions, log_prob
 
-class MultiDistrbution(Distribution):
+class MultiDistribution(Distribution):
     """A class that holds a sequence or tuple of distributions.
     
     Implementation is pulled fom MultiCategoricalDistribution"""
 
-    def __init__(self, action_dims: List[int], distribution_classes: List[Distribution]):
+    def __init__(self, action_dims: List[Union[int, Sequence[int]]], distribution_classes: List[Distribution]):
         super(MultiDistribution, self).__init__()
-        self.action_dims = action_dims
+        # Convert arrays in action_dims to lists.
+        for i in range(len(action_dims)):
+            if not isinstance(action_dims[i], int):
+                action_dims[i] = list(action_dims[i]) 
+        self.action_dims: List[Union[int, List[int]]] = action_dims
+        self.action_logit_sizes = [sum(action_dim) if isinstance(action_dim, list) else action_dim \
+            for action_dim in action_dims]
+        self.action_val_sizes = [len(action_dim) if isinstance(action_dim, list) else action_dim \
+            for action_dim in action_dims]
+        self.total_action_logits = sum(self.action_logit_sizes)
+        self.total_action_vals = sum(self.action_val_sizes)
         self.distribution_classes = distribution_classes
 
-    def proba_distribution_net(self, latent_dim: int) -> nn.Module:
-        action_logits = nn.Linear(latent_dim, sum(self.action_dims))
-        return action_logits
+    def proba_distribution_net(self, latent_dim: int, log_std_init: float=-2.0) -> nn.Module:
+        # log_std only gets used for the subset of the distribution that is diagonal gaussian,
+        # but we pipe it through everywhere for simplicity.
+        action_logits = nn.Linear(latent_dim, self.total_action_logits)
+        # TODO: allow action dependent std
+        log_std = nn.Parameter(th.ones(self.total_action_logits) * log_std_init, requires_grad=True)
+        return action_logits, log_std
 
-    def proba_distribution(self, action_logits: th.Tensor) -> "MultiDistribution":
-        self.distribution = [cls(logits=split) for split, cls in zip(th.split(action_logits, tuple(self.action_dims), dim=1), self.distribution_classes)]
+    def proba_distribution(self, action_logits: th.Tensor, log_std: th.Tensor) -> "MultiDistribution":
+        self.distribution: List[Union[Distribution, TorchDistribution]] = []
+
+        print("Action, Std shapes:", action_logits.shape, log_std.shape)
+        dist_logits = th.split(action_logits, self.action_logit_sizes, dim=1)
+        dist_std = th.split(log_std, self.action_logit_sizes, dim=1)
+        for i in range(len(self.action_dims)):
+            action_dim = self.action_dims[i]
+            cls = self.distribution_classes[i]
+            split_logits = dist_logits[i]
+            split_std = dist_std[i]
+
+            if issubclass(cls, DiagGaussianDistribution):
+                instance = cls(action_dim)
+                instance.proba_distribution(split_logits, split_std)
+                self.distribution.append(instance)
+            elif issubclass(cls, Distribution):
+                instance = cls(action_dim)
+                instance.proba_distribution(split_logits)
+                self.distribution.append(instance)
+            else:
+                print("Class: ", type(cls), cls)
+                self.distribution.append(cls(logits=split_logits))
         return self
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         # Extract each discrete action and compute log prob for their respective distributions
+        print("Multidist dims, shape:", self.action_dims, actions.shape)
+        dist_actions = th.split(actions, self.action_val_sizes, dim=1)
         return th.stack(
-            [dist.log_prob(action) for dist, action in zip(self.distribution, th.unbind(actions, dim=1))], dim=1
+            [dist.log_prob(action) for dist, action in zip(self.distribution, dist_actions)], dim=1
         ).sum(dim=1)
 
     def entropy(self) -> th.Tensor:
         return th.stack([dist.entropy() for dist in self.distribution], dim=1).sum(dim=1)
 
     def sample(self) -> th.Tensor:
-        return th.stack([dist.sample() for dist in self.distribution], dim=1)
+        return th.cat([dist.sample() for dist in self.distribution], dim=0)[None]
 
     def mode(self) -> th.Tensor:
-        return th.stack([th.argmax(dist.probs, dim=1) for dist in self.distribution], dim=1)
+        m: List[th.Tensor] = []
+        for dist in self.distribution:
+            if issubclass(dist.__class__, Distribution):
+                m.append(dist.mode())
+            else:
+                m.append(th.argmax(dist.probs, dim=1))
+        return th.cat(m, dim=1)
 
     def actions_from_params(self, action_logits: th.Tensor, deterministic: bool = False) -> th.Tensor:
         # Update the proba distribution
@@ -365,11 +408,12 @@ class MultiCategoricalDistribution(Distribution):
         return action_logits
 
     def proba_distribution(self, action_logits: th.Tensor) -> "MultiCategoricalDistribution":
-        self.distribution = [Categorical(logits=split) for split in th.split(action_logits, tuple(self.action_dims), dim=1)]
+        self.distribution: List[TorchDistribution] = [Categorical(logits=split) for split in th.split(action_logits, tuple(self.action_dims), dim=1)]
         return self
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         # Extract each discrete action and compute log prob for their respective distributions
+        print("Multicat dim, shape:", self.action_dims, actions.shape)
         return th.stack(
             [dist.log_prob(action) for dist, action in zip(self.distribution, th.unbind(actions, dim=1))], dim=1
         ).sum(dim=1)
@@ -638,91 +682,6 @@ class StateDependentNoiseDistribution(Distribution):
         log_prob = self.log_prob(actions)
         return actions, log_prob
 
-class TupleDistribution(Distribution):
-    """Tuple distribution."""
-
-    def __init__(self, distributions: Tuple[Distribution]):
-        super(Distribution, self).__init__()
-        self.distributions = distributions
-
-    @abstractmethod
-    def proba_distribution_net(self, *args, **kwargs) -> Union[nn.Module, Tuple[nn.Module, nn.Parameter]]:
-        # TODO
-        """Create the layers and parameters that represent the distribution.
-
-        Subclasses must define this, but the arguments and return type vary between
-        concrete classes."""
-
-    @abstractmethod
-    def proba_distribution(self, *args, **kwargs) -> "Distribution":
-        """Set parameters of the distribution.
-
-        :return: self
-        """
-
-    @abstractmethod
-    def log_prob(self, x: th.Tensor) -> th.Tensor:
-        """
-        Returns the log likelihood
-
-        :param x: the taken action
-        :return: The log likelihood of the distribution
-        """
-
-    @abstractmethod
-    def entropy(self) -> Optional[th.Tensor]:
-        """
-        Returns Shannon's entropy of the probability
-
-        :return: the entropy, or None if no analytical form is known
-        """
-
-    @abstractmethod
-    def sample(self) -> th.Tensor:
-        """
-        Returns a sample from the probability distribution
-
-        :return: the stochastic action
-        """
-
-    @abstractmethod
-    def mode(self) -> th.Tensor:
-        """
-        Returns the most likely action (deterministic output)
-        from the probability distribution
-
-        :return: the stochastic action
-        """
-
-    def get_actions(self, deterministic: bool = False) -> th.Tensor:
-        """
-        Return actions according to the probability distribution.
-
-        :param deterministic:
-        :return:
-        """
-        if deterministic:
-            return self.mode()
-        return self.sample()
-
-    @abstractmethod
-    def actions_from_params(self, *args, **kwargs) -> th.Tensor:
-        """
-        Returns samples from the probability distribution
-        given its parameters.
-
-        :return: actions
-        """
-
-    @abstractmethod
-    def log_prob_from_params(self, *args, **kwargs) -> Tuple[th.Tensor, th.Tensor]:
-        """
-        Returns samples and the associated log probabilities
-        from the probability distribution given its parameters.
-
-        :return: actions and log prob
-        """
-
 class TanhBijector(object):
     """
     Bijective transformation of a probability distribution
@@ -768,7 +727,7 @@ class TanhBijector(object):
 
 
 # Note: `dist_kwargs` appears unused
-def get_action_space_params(action_space: gym.spaces.Space) -> Tuple[int, T]:
+def get_action_space_params(action_space: gym.spaces.Space, use_sde: bool = False) -> Tuple[int, Distribution]:
     if isinstance(action_space, spaces.Box):
         assert len(action_space.shape) == 1, "Error: the action space must be a vector"
         cls = StateDependentNoiseDistribution if use_sde else DiagGaussianDistribution
@@ -808,9 +767,11 @@ def make_proba_distribution(
         sizes = []
         classes = []
         for space in action_space:
-            n, distribution_cls = get_action_space_params(space)
+            n, distribution_cls = get_action_space_params(space, use_sde)
+            print("Found subdistribution w/ type, size:", type(space), n)
             sizes.append(n)
             classes.append(distribution_cls)
+        print("Make multi distribution w/ sizes:", sizes)
         return MultiDistribution(sizes, classes)
 
     n, distribution_cls = get_action_space_params(action_space)
