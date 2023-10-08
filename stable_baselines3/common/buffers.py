@@ -14,7 +14,6 @@ from stable_baselines3.common.type_aliases import (
     RolloutBufferSamples,
 )
 from stable_baselines3.common.vec_env import VecNormalize
-from profiler import Profiler
 
 try:
     # Check memory used by replay buffer when possible
