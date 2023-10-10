@@ -327,7 +327,6 @@ class MultiDistribution(Distribution):
     def proba_distribution(self, action_logits: th.Tensor, log_std: th.Tensor) -> "MultiDistribution":
         self.distribution: List[Union[Distribution, TorchDistribution]] = []
 
-        print("Action, Std shapes:", action_logits.shape, log_std.shape)
         dist_logits = th.split(action_logits, self.action_logit_sizes, dim=1)
         dist_std = th.split(log_std, self.action_logit_sizes, dim=0)
         for i in range(len(self.action_dims)):
@@ -345,13 +344,11 @@ class MultiDistribution(Distribution):
                 instance.proba_distribution(split_logits)
                 self.distribution.append(instance)
             else:
-                print("Class: ", type(cls), cls)
                 self.distribution.append(cls(logits=split_logits))
         return self
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         # Extract each discrete action and compute log prob for their respective distributions
-        print("Multidist dims, shape:", self.action_dims, actions.shape)
         dist_actions = th.split(actions, self.action_val_sizes, dim=1)
         return th.stack(
             [dist.log_prob(action) for dist, action in zip(self.distribution, dist_actions)], dim=1
@@ -413,7 +410,6 @@ class MultiCategoricalDistribution(Distribution):
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         # Extract each discrete action and compute log prob for their respective distributions
-        print("Multicat dim, shape:", self.action_dims, actions.shape)
         return th.stack(
             [dist.log_prob(action) for dist, action in zip(self.distribution, th.unbind(actions, dim=1))], dim=1
         ).sum(dim=1)
@@ -768,10 +764,8 @@ def make_proba_distribution(
         classes = []
         for space in action_space:
             n, distribution_cls = get_action_space_params(space, use_sde)
-            print("Found subdistribution w/ type, size:", type(space), n)
             sizes.append(n)
             classes.append(distribution_cls)
-        print("Make multi distribution w/ sizes:", sizes)
         return MultiDistribution(sizes, classes)
 
     n, distribution_cls = get_action_space_params(action_space)
